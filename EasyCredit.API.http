@@ -1,0 +1,6 @@
+@EasyCredit.API_HostAddress = http://localhost:5136
+
+GET {{EasyCredit.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
