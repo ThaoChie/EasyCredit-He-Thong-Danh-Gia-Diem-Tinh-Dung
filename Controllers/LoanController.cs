@@ -3,15 +3,18 @@ using EasyCredit.API.Models;
 using EasyCredit.API.Data;
 using EasyCredit.API.Services;
 using Microsoft.EntityFrameworkCore;
-// Thư viện tạo PDF
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
 using QuestPDF.Infrastructure;
+using Microsoft.AspNetCore.Authorization;
+using EasyCredit.API.DTOs;
+using System.Security.Claims; // <--- Cần thêm cái này để lấy ID người dùng
 
 namespace EasyCredit.API.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Authorize] // Yêu cầu đăng nhập (nhưng không bắt buộc là Admin ở đây)
 public class LoanController : ControllerBase
 {
     private readonly ApplicationDbContext _context;
@@ -28,12 +31,13 @@ public class LoanController : ControllerBase
     public IActionResult ApplyForLoan([FromBody] LoanApplication application)
     {
         application.CreatedAt = DateTime.Now;
-        application.Status = "Pending";
+        // QUAN TRỌNG: Luôn set là Pending để chờ duyệt
+        application.Status = "Pending"; 
         
         _context.LoanApplications.Add(application);
         _context.SaveChanges();
 
-        // Tự động chấm điểm
+        // Chấm điểm (giữ nguyên)
         var financialProfile = _context.FinancialProfiles
                                 .FirstOrDefault(f => f.UserId == application.UserId);
 
@@ -41,29 +45,45 @@ public class LoanController : ControllerBase
         {
             var scoreResult = _scoringService.CalculateScore(financialProfile, application.Id);
             _context.CreditScores.Add(scoreResult);
-
-            if (scoreResult.Recommendation == "Approve") application.Status = "Approved";
-            if (scoreResult.Recommendation == "Reject") application.Status = "Rejected";
-
+            // Bỏ đoạn tự động duyệt Approve/Reject ở đây
             _context.SaveChanges();
         }
 
         return Ok(new { Message = "Nộp đơn thành công!", LoanId = application.Id, Status = application.Status });
     }
 
-    // 2. API Lấy danh sách (Kèm User và Điểm)
+    // 2. API Lấy danh sách (ĐÃ SỬA LOGIC Ở ĐÂY)
     [HttpGet]
+    // ❌ ĐÃ BỎ DÒNG: [Authorize(Roles = "Admin")]
     public IActionResult GetAllLoans()
     {
-        var loans = _context.LoanApplications
+        // Lấy User ID và Role từ Token của người đang đăng nhập
+        var userIdString = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        var role = User.FindFirst(ClaimTypes.Role)?.Value;
+
+        if (string.IsNullOrEmpty(userIdString)) return Unauthorized();
+        var userId = int.Parse(userIdString);
+
+        // Chuẩn bị dữ liệu
+        var query = _context.LoanApplications
                             .Include(l => l.User)
                             .Include(l => l.CreditScore)
-                            .OrderByDescending(l => l.CreatedAt)
-                            .ToList();
+                            .AsQueryable();
+
+        // LOGIC PHÂN QUYỀN:
+        // Nếu KHÔNG phải Admin thì chỉ được lấy đơn của chính mình
+        if (role != "Admin")
+        {
+            query = query.Where(l => l.UserId == userId);
+        }
+
+        // Sắp xếp đơn mới nhất lên đầu
+        var loans = query.OrderByDescending(l => l.CreatedAt).ToList();
+        
         return Ok(loans);
     }
 
-    // 3. API Tải hợp đồng PDF (Đã sửa lỗi Font chữ)
+    // 3. API Tải hợp đồng PDF (Giữ nguyên)
     [HttpGet("{id}/contract")]
     public IActionResult DownloadContract(int id)
     {
@@ -71,7 +91,6 @@ public class LoanController : ControllerBase
         
         if (loan == null) return NotFound("Không tìm thấy đơn vay");
 
-        // Tạo nội dung PDF
         var document = Document.Create(container =>
         {
             container.Page(page =>
@@ -79,64 +98,76 @@ public class LoanController : ControllerBase
                 page.Size(PageSizes.A4);
                 page.Margin(2, Unit.Centimetre);
                 page.PageColor(Colors.White);
+                page.DefaultTextStyle(x => x.FontSize(12));
+
+                page.Header().Text("CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM").SemiBold().FontSize(16).AlignCenter();
+
+                page.Content().PaddingVertical(1, Unit.Centimetre).Column(x =>
+                {
+                    x.Item().Text("Độc lập - Tự do - Hạnh phúc").AlignCenter().Italic();
+                    x.Item().PaddingTop(20).Text("HỢP ĐỒNG TÍN DỤNG").Bold().FontSize(20).AlignCenter();
+                    x.Item().Text($"Số: HD-{loan.Id}/{DateTime.Now.Year}").AlignCenter();
+                    x.Item().PaddingTop(20).Text($"Bên vay: {loan.User?.FullName}");
+                    x.Item().Text($"Số tiền: {loan.Amount:N0} VNĐ");
+                    x.Item().Text($"Trạng thái: {loan.Status}");
+                    
+                    x.Item().PaddingTop(30).Row(row =>
+                    {
+                        row.RelativeItem().Column(c => { c.Item().Text("ĐẠI DIỆN BÊN A").Bold().AlignCenter(); });
+                        row.RelativeItem().Column(c => { c.Item().Text("ĐẠI DIỆN BÊN B").Bold().AlignCenter(); c.Item().PaddingTop(40).Text(loan.User?.FullName).AlignCenter(); });
+                    });
+                });
                 
-                // QUAN TRỌNG: Chỉ set cỡ chữ, KHÔNG set FontFamily để tránh lỗi
-                page.DefaultTextStyle(x => x.FontSize(12)); 
-
-                page.Header()
-                    .Text("CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM")
-                    .SemiBold().FontSize(16).AlignCenter();
-
-                page.Content()
-                    .PaddingVertical(1, Unit.Centimetre)
-                    .Column(x =>
-                    {
-                        x.Item().Text("Độc lập - Tự do - Hạnh phúc").AlignCenter().Italic();
-                        x.Item().PaddingTop(20).Text("HỢP ĐỒNG TÍN DỤNG").Bold().FontSize(20).AlignCenter();
-                        x.Item().Text($"Số: HD-{loan.Id}/2025").AlignCenter();
-
-                        x.Item().PaddingTop(20).Text("Hôm nay, ngày " + DateTime.Now.ToString("dd/MM/yyyy") + ", tại EasyCredit, chúng tôi gồm:");
-                        
-                        x.Item().PaddingTop(10).Text("BÊN A (BÊN CHO VAY): CÔNG TY TÀI CHÍNH EASYCREDIT").Bold();
-                        
-                        x.Item().PaddingTop(10).Text("BÊN B (BÊN VAY):").Bold();
-                        x.Item().Text($"- Ông/Bà: {loan.User?.FullName}");
-                        x.Item().Text($"- Mã khách hàng: {loan.UserId}");
-
-                        x.Item().PaddingTop(20).Text("Hai bên thống nhất ký kết hợp đồng vay vốn với nội dung sau:");
-                        x.Item().PaddingTop(5).Text($"1. Số tiền vay: {loan.Amount:N0} VNĐ");
-                        x.Item().Text($"2. Mục đích sử dụng: {loan.Purpose}");
-                        x.Item().Text($"3. Lãi suất: 1.5%/tháng");
-                        x.Item().Text($"4. Trạng thái hồ sơ: {loan.Status}");
-
-                        x.Item().PaddingTop(30).Row(row =>
-                        {
-                            row.RelativeItem().Column(c => {
-                                c.Item().Text("ĐẠI DIỆN BÊN A").Bold().AlignCenter();
-                                c.Item().Text("(Đã ký)").Italic().AlignCenter();
-                            });
-                            row.RelativeItem().Column(c => {
-                                c.Item().Text("ĐẠI DIỆN BÊN B").Bold().AlignCenter();
-                                c.Item().PaddingTop(50).Text(loan.User?.FullName).AlignCenter();
-                            });
-                        });
-                    });
-
-                page.Footer()
-                    .AlignCenter()
-                    .Text(x =>
-                    {
-                        x.Span("Trang ");
-                        x.CurrentPageNumber();
-                    });
+                page.Footer().AlignCenter().Text(x => { x.Span("Trang "); x.CurrentPageNumber(); });
             });
         });
 
-        // Xuất ra file Stream
-        var stream = new MemoryStream();
+        var stream = new System.IO.MemoryStream();
         document.GeneratePdf(stream);
         stream.Position = 0;
-
         return File(stream, "application/pdf", $"HopDong_Vay_{id}.pdf");
+    }
+
+    // 4. API Admin duyệt (Giữ nguyên)
+    [HttpPut("{id}/status")]
+    [Authorize(Roles = "Admin")]
+    public async Task<IActionResult> UpdateLoanStatus(int id, [FromBody] UpdateLoanStatusDto statusDto)
+    {
+        var loan = await _context.LoanApplications.FirstOrDefaultAsync(l => l.Id == id);
+        if (loan == null) return NotFound($"Không tìm thấy đơn vay ID: {id}.");
+
+        loan.Status = statusDto.Status;
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = $"Cập nhật trạng thái thành công." });
+    }
+
+    [HttpPost("{id}/accept")]
+    public async Task<IActionResult> AcceptContract(int id)
+    {
+        // 1. Lấy User đang đăng nhập
+        var userIdString = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userIdString)) return Unauthorized();
+        var userId = int.Parse(userIdString);
+
+        // 2. Tìm đơn vay
+        var loan = await _context.LoanApplications.FirstOrDefaultAsync(l => l.Id == id);
+        
+        if (loan == null) return NotFound("Không tìm thấy đơn vay.");
+        
+        // 3. Kiểm tra quyền sở hữu
+        if (loan.UserId != userId) return Forbid("Bạn không có quyền ký hợp đồng này.");
+
+        // 4. Chỉ được ký khi trạng thái đang là "Approved" (Admin đã duyệt)
+        if (loan.Status != "Approved")
+        {
+            return BadRequest("Hợp đồng chưa sẵn sàng hoặc đã được xử lý.");
+        }
+
+        // 5. Cập nhật trạng thái thành "Disbursed" (Đã giải ngân)
+        loan.Status = "Disbursed";
+        await _context.SaveChangesAsync();
+
+        return Ok(new { Message = "Chúc mừng! Bạn đã ký hợp đồng thành công. Tiền đang được chuyển về ví." });
     }
 }
